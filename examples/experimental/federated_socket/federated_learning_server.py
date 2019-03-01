@@ -75,7 +75,10 @@ class FederatedLearningServer:
         while True:
             print("Waiting for message in queue")
             message = await self.broadcast_queue.get()
+
             for idx, ws in enumerate(self.connections):
+                if message == '[bobby] ready':
+                    await ws.send('GIMME_DATA')
                 if message == 'STAT':
                     await ws.send(self.msg(self.current_status))
                     await ws.send('STAT')
@@ -83,31 +86,7 @@ class FederatedLearningServer:
                     await ws.send('META')
                 if message == 'START_TRAINING_ROUND':
                     pass
-"""
-                    f0
-                    w0 t_1 = tensorA()
-                    w0 t_2 = tensorB()
-                    foobar = t_1 @ t_2
-SEARCH xs
-ptr
-deserialize and store in my websocket_worker
 
-
-
-f0: t_1, t_2 => @
-w0:
-
-
-f0: @w0, give pointers to all @w0._objects
-f0: iterate on first dim of xs, ys
-f0: ptr = model.send(@w0)
-w0: registers model and stores it locally
-f0: ptr(xs_t)
-
-"""
-
-#                    self.model.send(
-#                    await ws.send(f'CUR_MODEL {self.serialized_model()}')
 
     async def handler(self, websocket, path):
         cid = len(self.connections)
@@ -116,6 +95,7 @@ f0: ptr(xs_t)
         asyncio.set_event_loop(self.loop)
         consumer_task = asyncio.ensure_future(self.consumer_handler(websocket, cid))
         producer_task = asyncio.ensure_future(self.producer_handler(websocket, cid))
+        await websocket.send(f'STAT')
 
         done, pending = await asyncio.wait([consumer_task, producer_task] , return_when=asyncio.FIRST_COMPLETED)
         print("Connection closed, canceling pending tasks")

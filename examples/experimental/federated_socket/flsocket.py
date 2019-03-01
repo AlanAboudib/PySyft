@@ -34,6 +34,7 @@ def start_proc(participant, kwargs):
         server.start()
     p = Process(target=target)
     p.start()
+    return p
 
 async def repl(uri='ws://localhost:8765'):
     async with websockets.connect(uri) as websocket:
@@ -45,7 +46,7 @@ async def repl(uri='ws://localhost:8765'):
             resp = await websocket.recv()
             print("<REPL> {}".format(resp))
 
-def main():
+def xmain():
     hook = sy.TorchHook(torch)
     kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, "hook": hook }
     start_proc(FederatedLearningServer, kwargs)
@@ -76,8 +77,15 @@ def main():
     # repl for issuing commands
     asyncio.get_event_loop().run_until_complete(repl())
 
-
-
+def main():
+    hook = sy.TorchHook(torch)
+    kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, "hook": hook }
+    server = start_proc(FederatedLearningServer, kwargs)
+    time.sleep(1)
+    t = torch.ones(5)
+    worker_args = ChainMap({ 'id': f'bobby', 'data': (t) }, kwargs)
+    client = start_proc(FederatedLearningClient, worker_args)
+    time.sleep(1)
 
 """
     How to setup FL environment

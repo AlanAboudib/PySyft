@@ -2,7 +2,7 @@ import time
 import asyncio
 import websockets
 import syft as sy
-
+from syft.serde import serialize
 class FederatedLearningClient:
     def __init__(self, id, connection_params, hook, data=(), loop=None):
         self.port = connection_params['port']
@@ -39,6 +39,9 @@ class FederatedLearningClient:
                 await websocket.send(self.msg(self.current_status))
             if msg == 'META':
                 await websocket.send(self.msg(self.worker_metadata()))
+            if msg == 'GIMME_DATA':
+                await websocket.send(serialize(self.worker._objects))
+
 
 
     async def handler(self, websocket):
