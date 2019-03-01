@@ -8,7 +8,7 @@ from syft.workers.base import BaseWorker
 class FLServerWorker(BaseWorker):
     def __init__(
         self, hook, id=0, known_workers={}, is_client_worker=False,
-        log_msgs=False, verbose=False, connection_params={}
+        log_msgs=False, verbose=False, connection_params={}, data={}
         ):
         # TODO get angry when we have no connection params
         self.port = connection_params['port']
@@ -18,7 +18,7 @@ class FLServerWorker(BaseWorker):
         self.broadcast_queue = asyncio.Queue()
         self.loop = asyncio.new_event_loop()
 
-        super().__init__(hook, id, known_workers, is_client_worker, log_msgs, verbose)
+        super().__init__(hook, id, known_workers, data, is_client_worker, log_msgs, verbose)
         self.start()
 
 

@@ -18,14 +18,14 @@ class FLClientWorker(BaseWorker):
         self.msg_queue = asyncio.Queue()
         self.loop = asyncio.new_event_loop()
         self.uri = f'ws://{self.host}:{self.port}'
-        super().__init__(hook, id, known_workers, is_client_worker, log_msgs, verbose)
+        super().__init__(hook, id, known_workers, data, is_client_worker, log_msgs, verbose)
         self.start()
 
     def msg(self, msg):
         return f'[{self.id}] {msg}'
 
     def worker_metadata(self):
-        return [ obj.shape for key, obj in self.worker._objects.items() ]
+        return [ obj.shape for key, obj in self._objects.items() ]
 
     async def consumer_handler(self, websocket):
         while True:
@@ -44,7 +44,7 @@ class FLClientWorker(BaseWorker):
             if msg == 'META':
                 await websocket.send(self.msg(self.worker_metadata()))
             if msg == 'GIMME_DATA':
-                await websocket.send(serialize(self.worker._objects))
+                await websocket.send(serialize(self._objects))
 
     async def handler(self, websocket):
         asyncio.set_event_loop(self.loop)
