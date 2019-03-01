@@ -61,15 +61,22 @@ def xxxmain():
 
 def main():
     hook = sy.TorchHook(torch)
-    kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, "hook": hook }
+    t0 = torch.ones(5) + 2
+    kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, 'data': (t0), "hook": hook }
     server = start_proc(FLServerWorker, kwargs)
 
     time.sleep(1)
+
+
     t = torch.ones(5)
     worker_args = ChainMap({ 'id': f'bobby', 'data': (t) }, kwargs)
-    client = start_proc(FLClientWorker, worker_args)
+    # connect bobby to the server:
+    client = FLClientWorker(**worker_args)
     time.sleep(1)
 
+    # see the server:
+    print(client.known_workers)
+    client._objects[0].send('fed1')
 
 """
     How to setup FL environment

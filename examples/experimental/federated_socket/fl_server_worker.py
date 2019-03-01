@@ -26,8 +26,8 @@ class FLServerWorker(BaseWorker):
         return location._recv_msg(message)
 
     def _recv_msg(self, message):
+        self.broadcast_queue.put(message)
         return self.recv_msg(message)
-
 
     def msg(self, msg):
         return f'[{self.id}] {msg}'

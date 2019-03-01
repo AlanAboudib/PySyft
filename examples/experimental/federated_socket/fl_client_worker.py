@@ -28,6 +28,7 @@ class FLClientWorker(BaseWorker):
         return [ obj.shape for key, obj in self._objects.items() ]
 
     async def consumer_handler(self, websocket):
+        """ receive messages """
         while True:
             if not websocket.open:
                 websocket = await websockets.connect(self.uri)
@@ -37,14 +38,17 @@ class FLClientWorker(BaseWorker):
 
 
     async def producer_handler(self, websocket):
+        """ send messages """
         while True:
             msg = await self.msg_queue.get()
             if msg == 'STAT':
                 await websocket.send(self.msg(self.current_status))
-            if msg == 'META':
+            elif msg == 'META':
                 await websocket.send(self.msg(self.worker_metadata()))
-            if msg == 'GIMME_DATA':
+            elif msg == 'GIMME_DATA':
                 await websocket.send(serialize(self._objects))
+            else:
+               await websocket.send(msg)
 
     async def handler(self, websocket):
         asyncio.set_event_loop(self.loop)
@@ -62,6 +66,9 @@ class FLClientWorker(BaseWorker):
             while True:
                 if not websocket.open:
                     websocket = await websockets.connect(self.uri)
+
+                print("connected...")
+                # here is where we setup the worker datastructures
                 await self.handler(websocket)
 
     def start(self):
@@ -69,11 +76,10 @@ class FLClientWorker(BaseWorker):
         print("Starting client..\n")
 
 
-
-
     def _send_msg(self, message, location):
+        #self.msg_queue.put(message)
         return location._recv_msg(message)
 
     def _recv_msg(self, message):
+        self.msg_queue.put(message)
         return self.recv_msg(message)
-
