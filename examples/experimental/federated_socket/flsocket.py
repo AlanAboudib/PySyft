@@ -65,14 +65,31 @@ def main():
 
     for idx in np.arange(num_workers):
         x = torch.tensor(np.array(xs[idx]))
-        x.id = 'xs'
+#        x.id = 'xs'
+        x.tags = ['xs']
         y = torch.tensor(np.array(ys[idx]))
-        y.id = 'ys'
+#        y.id = 'ys'
+        x.tags = ['ys']
         worker_args = ChainMap({ 'id': f'w{idx}', 'data': (x, y) }, kwargs)
         start_proc(FederatedLearningClient, worker_args)
 
     # repl for issuing commands
     asyncio.get_event_loop().run_until_complete(repl())
+
+
+
+
+"""
+    How to setup FL environment
+"""
+# host python clients
+# define how clients connect to server
+# define how data goes into the worker
+# define the model
+#    (a) - we send the entire model params +  the training plan
+#        - at we define the model as a class (msgpack, protobuf)
+#    (b) - we send the entire model params +  the training plan
+#        - we perform every instruction using workers (notebooks)
 
 if __name__ == "__main__":
     main()
