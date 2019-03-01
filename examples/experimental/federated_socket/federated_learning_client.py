@@ -16,6 +16,7 @@ class FederatedLearningClient:
         self.uri = f'ws://{self.host}:{self.port}'
         for item in data:
             self.worker.register_obj(item)
+        self.start()
 
     def msg(self, msg):
         return f'[{self.id}] {msg}'

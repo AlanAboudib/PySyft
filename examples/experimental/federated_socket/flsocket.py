@@ -15,6 +15,9 @@ import syft as sy
 from federated_learning_server import FederatedLearningServer
 from federated_learning_client import FederatedLearningClient
 
+from fl_server_worker import FLServerWorker
+from fl_client_worker import FLClientWorker
+
 def data_transforms():
     return transforms.Compose([
                         transforms.ToTensor(),
@@ -31,7 +34,7 @@ def start_proc(participant, kwargs):
     """ helper function for spinning up a websocket participant """
     def target():
         server = participant(**kwargs)
-        server.start()
+        #server.start()
     p = Process(target=target)
     p.start()
     return p
@@ -46,38 +49,7 @@ async def repl(uri='ws://localhost:8765'):
             resp = await websocket.recv()
             print("<REPL> {}".format(resp))
 
-def xmain():
-    hook = sy.TorchHook(torch)
-    kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, "hook": hook }
-    start_proc(FederatedLearningServer, kwargs)
-    time.sleep(1)
-
-    train, test  = build_datasets()
-    num_workers = 3
-    data_sent = 10
-    xs = [ [] for _ in np.arange(num_workers) ]
-    ys = [ [] for _ in np.arange(num_workers) ]
-    # for now, we save ourselves the trouble of loading ALL the MNIST data:
-    for idx in np.arange(data_sent):
-        (tensor, lbl) = train[idx]
-        bucket = idx % num_workers
-        xs[bucket].append(tensor)
-        ys[bucket].append(lbl)
-
-    for idx in np.arange(num_workers):
-        x = torch.tensor(np.array(xs[idx]))
-#        x.id = 'xs'
-        x.tags = ['xs']
-        y = torch.tensor(np.array(ys[idx]))
-#        y.id = 'ys'
-        x.tags = ['ys']
-        worker_args = ChainMap({ 'id': f'w{idx}', 'data': (x, y) }, kwargs)
-        start_proc(FederatedLearningClient, worker_args)
-
-    # repl for issuing commands
-    asyncio.get_event_loop().run_until_complete(repl())
-
-def main():
+def xxxmain():
     hook = sy.TorchHook(torch)
     kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, "hook": hook }
     server = start_proc(FederatedLearningServer, kwargs)
@@ -86,6 +58,18 @@ def main():
     worker_args = ChainMap({ 'id': f'bobby', 'data': (t) }, kwargs)
     client = start_proc(FederatedLearningClient, worker_args)
     time.sleep(1)
+
+def main():
+    hook = sy.TorchHook(torch)
+    kwargs = { "id": "fed1", "connection_params": { 'host': 'localhost', 'port': 8765 }, "hook": hook }
+    server = start_proc(FLServerWorker, kwargs)
+
+    time.sleep(1)
+    t = torch.ones(5)
+    worker_args = ChainMap({ 'id': f'bobby', 'data': (t) }, kwargs)
+    client = start_proc(FLClientWorker, worker_args)
+    time.sleep(1)
+
 
 """
     How to setup FL environment

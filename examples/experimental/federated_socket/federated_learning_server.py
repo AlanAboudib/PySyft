@@ -86,8 +86,6 @@ class FederatedLearningServer:
                     await ws.send('META')
                 if message == 'START_TRAINING_ROUND':
                     pass
-
-
     async def handler(self, websocket, path):
         cid = len(self.connections)
         await websocket.send(f'Welcome {cid}')
