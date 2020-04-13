@@ -1,19 +1,23 @@
-import syft
 import torch
-from syft.frameworks.torch.tensors.interpreters.abstract import AbstractTensor
-from syft.frameworks.torch.tensors.interpreters.utils import hook
+
+import syft
+from syft.frameworks.torch.nn import nn
+from syft.frameworks.torch.tensors.interpreters.additive_shared import AdditiveSharingTensor
+from syft.generic.frameworks.hook import hook_args
+from syft.generic.frameworks.overload import overloaded
+from syft.generic.pointers.multi_pointer import MultiPointerTensor
+from syft.generic.tensor import AbstractTensor
+from syft.workers.abstract import AbstractWorker
 
 
 class FixedPrecisionTensor(AbstractTensor):
     def __init__(
         self,
-        parent: AbstractTensor = None,
         owner=None,
         id=None,
-        field: int = (2 ** 31) - 1,
+        field: int = 2 ** 62,
         base: int = 10,
         precision_fractional: int = 3,
-        precision_integral: int = 1,
         kappa: int = 1,
         tags: set = None,
         description: str = None,
@@ -29,29 +33,16 @@ class FixedPrecisionTensor(AbstractTensor):
         p decimals)
 
         Args:
-            parent: An optional AbstractTensor wrapper around the FixedPrecisionTensor
-                which makes it so that you can pass this FixedPrecisionTensor to all
-                the other methods/functions that PyTorch likes to use, although
-                it can also be other tensors which extend AbstractTensor, such
-                as custom tensors for Secure Multi-Party Computation or
-                Federated Learning.
             owner: An optional BaseWorker object to specify the worker on which
                 the tensor is located.
             id: An optional string or integer id of the FixedPrecisionTensor.
         """
-        super().__init__(tags, description)
-
-        self.parent = parent
-        self.owner = owner
-        self.id = id
-        self.child = None
+        super().__init__(id=id, owner=owner, tags=tags, description=description)
 
         self.field = field
         self.base = base
         self.precision_fractional = precision_fractional
-        self.precision_integral = precision_integral
         self.kappa = kappa
-        self.torch_max_value = torch.tensor([round(self.field / 2)])
 
     def get_class_attributes(self):
         """
@@ -59,23 +50,56 @@ class FixedPrecisionTensor(AbstractTensor):
         for example precision_fractional is important when wrapping the result of a method
         on a self which is a fixed precision tensor with a non default precision_fractional.
         """
-        return {"precision_fractional": self.precision_fractional}
+        return {
+            "field": self.field,
+            "base": self.base,
+            "precision_fractional": self.precision_fractional,
+            "kappa": self.kappa,
+        }
 
-    def fix_precision(self):
-        """This method encodes the .child object using fixed precision
-        Question: what's the use case? --tr"""
+    @property
+    def data(self):
+        return self
+
+    @data.setter
+    def data(self, new_data):
+        self.child = new_data.child
+        return self
+
+    @property
+    def grad(self):
+        """
+        Gradient makes no sense for Fixed Precision Tensor, so we make it clear
+        that if someone query .grad on a Fixed Precision Tensor it doesn't error
+        but returns grad and can't be set
+        """
+        return None
+
+    def backward(self, *args, **kwargs):
+        """Calling backward on Precision Tensor doesn't make sense, but sometimes a call
+        can be propagated downward the chain to an Precision Tensor (for example in
+        create_grad_objects), so we just ignore the call."""
+        pass
+
+    def attr(self, attr_name):
+        return self.__getattribute__(attr_name)
+
+    def fix_precision(self, check_range=True):
+        """This method encodes the .child object using fixed precision"""
 
         rational = self.child
 
-        owner = rational.owner
         upscaled = (rational * self.base ** self.precision_fractional).long()
-        field_element = upscaled % self.field
 
-        # Handle neg values
-        gate = field_element.gt(self.torch_max_value).long()
-        neg_nums = (field_element - self.field) * gate
-        pos_nums = field_element * (1 - gate)
-        field_element = neg_nums + pos_nums
+        if check_range:
+            assert (
+                upscaled.abs() < (self.field / 2)
+            ).all(), (
+                f"{rational} cannot be correctly embedded: choose bigger field or a lower precision"
+            )
+
+        field_element = upscaled % self.field
+        field_element.owner = rational.owner
 
         self.child = field_element
         return self
@@ -85,93 +109,654 @@ class FixedPrecisionTensor(AbstractTensor):
         one, encoded with floating point precision"""
 
         value = self.child.long() % self.field
+        torch_max_value = torch.tensor(self.field).long()
 
-        if len(value.size()) == 0:
-            # raise TypeError("Can't decode empty tensor")
-            return None
-
-        gate = value.native_gt(self.torch_max_value).long()
+        gate = value.native_gt(torch_max_value / 2).long()
         neg_nums = (value - self.field) * gate
         pos_nums = value * (1 - gate)
         result = (neg_nums + pos_nums).float() / (self.base ** self.precision_fractional)
 
         return result
 
-    def truncate(self, precision_fractional):
+    def truncate(self, precision_fractional, check_sign=True):
         truncation = self.base ** precision_fractional
-        self.child /= truncation
-        return self
 
-    @hook
-    def add(self, _self, *args, **kwargs):
+        # We need to make sure that values are truncated "towards 0"
+        # i.e. for a field of 100, 70 (equivalent to -30), should be truncated
+        # at 97 (equivalent to -3), not 7
+        if isinstance(self.child, AdditiveSharingTensor) or not check_sign:  # Handle FPT>(wrap)>AST
+            self.child = self.child / truncation
+            return self
+        else:
+            torch_max_value = torch.tensor(self.field).long()
+            gate = self.child.native_gt(torch_max_value / 2).long()
+            neg_nums = (self.child - self.field) / truncation + self.field
+            pos_nums = self.child / truncation
+            self.child = neg_nums * gate + pos_nums * (1 - gate)
+            return self
+
+    @overloaded.method
+    def add(self, _self, other):
         """Add two fixed precision tensors together.
         """
-        response = getattr(_self, "add")(*args, **kwargs)
+        if isinstance(other, (int, float)):
+            scaled_int = int(other * self.base ** self.precision_fractional)
+            return getattr(_self, "add")(scaled_int)
+
+        if isinstance(_self, AdditiveSharingTensor) and isinstance(other, torch.Tensor):
+            # If we try to add a FPT>(wrap)>AST and a FPT>torch.tensor,
+            # we want to perform AST + torch.tensor
+            other = other.wrap()
+        elif isinstance(other, AdditiveSharingTensor) and isinstance(_self, torch.Tensor):
+            # If we try to add a FPT>torch.tensor and a FPT>(wrap)>AST,
+            # we swap operators so that we do the same operation as above
+            _self, other = other, _self.wrap()
+
+        response = getattr(_self, "add")(other)
+        response %= self.field  # Wrap around the field
 
         return response
 
     __add__ = add
+    __radd__ = add
 
-    @hook
+    def add_(self, value_or_tensor, tensor=None):
+        if tensor is None:
+            result = self.add(value_or_tensor)
+        else:
+            result = self.add(value_or_tensor * tensor)
+
+        self.child = result.child
+        return self
+
+    def __iadd__(self, other):
+        """Add two fixed precision tensors together.
+        """
+        self.child = self.add(other).child
+
+        return self
+
+    @overloaded.method
+    def sub(self, _self, other):
+        """Subtracts a fixed precision tensor from another one.
+        """
+        if isinstance(other, (int, float)):
+            scaled_int = int(other * self.base ** self.precision_fractional)
+            return getattr(_self, "sub")(scaled_int)
+
+        if isinstance(_self, AdditiveSharingTensor) and isinstance(other, torch.Tensor):
+            # If we try to subtract a FPT>(wrap)>AST and a FPT>torch.tensor,
+            # we want to perform AST - torch.tensor
+            other = other.wrap()
+        elif isinstance(other, AdditiveSharingTensor) and isinstance(_self, torch.Tensor):
+            # If we try to subtract a FPT>torch.tensor and a FPT>(wrap)>AST,
+            # we swap operators so that we do the same operation as above
+            _self, other = -other, -_self.wrap()
+
+        response = getattr(_self, "sub")(other)
+        response %= self.field  # Wrap around the field
+
+        return response
+
+    __sub__ = sub
+
+    def __rsub__(self, other):
+        return (self - other) * -1
+
+    def sub_(self, value_or_tensor, tensor=None):
+        if tensor is None:
+            result = self.sub(value_or_tensor)
+        else:
+            result = self.sub(value_or_tensor * tensor)
+
+        self.child = result.child
+        return self
+
+    def __isub__(self, other):
+        self.child = self.sub(other).child
+
+        return self
+
+    @overloaded.method
     def t(self, _self, *args, **kwargs):
         """Transpose a tensor. Hooked is handled by the decorator"""
         response = getattr(_self, "t")(*args, **kwargs)
 
         return response
 
-    def mul(self, *args, **kwargs):
+    def mul_and_div(self, other, cmd):
         """
-        Hook manually mul to add the truncation part which is inherent to multiplication
-        in the fixed precision setting
+        Hook manually mul and div to add the truncation/rescaling part
+        which is inherent to these operations in the fixed precision setting
         """
-        # Replace all syft tensor with their child attribute
-        new_self, new_args, new_kwargs = syft.frameworks.torch.hook_args.hook_method_args(
-            "mul", self, args, kwargs
-        )
+        changed_sign = False
+        if isinstance(other, FixedPrecisionTensor):
+            assert (
+                self.precision_fractional == other.precision_fractional
+            ), "In mul and div, all args should have the same precision_fractional"
+            assert self.base == other.base, "In mul and div, all args should have the same base"
+
+        if isinstance(other, (int, torch.Tensor, AdditiveSharingTensor)):
+            new_self = self.child
+            new_other = other
+        elif isinstance(other, float):
+            raise NotImplementedError(
+                "Can't multiply or divide a FixedPrecisionTensor with a float value"
+            )
+
+        elif isinstance(self.child, (AdditiveSharingTensor, MultiPointerTensor)) and isinstance(
+            other.child, torch.Tensor
+        ):
+            # If operands are FPT>AST and FPT>torch.tensor,
+            # we want to perform the operation on AST and torch.tensor
+            if cmd == "mul":
+                new_self = self.child
+            elif cmd == "div":
+                new_self = self.child * self.base ** self.precision_fractional
+            new_other = other
+
+        elif isinstance(other.child, (AdditiveSharingTensor, MultiPointerTensor)) and isinstance(
+            self.child, torch.Tensor
+        ):
+            # If operands are FPT>torch.tensor and FPT>AST,
+            # we swap operators so that we do the same operation as above
+            if cmd == "mul":
+                new_self = other.child
+                new_other = self
+            elif cmd == "div":
+                # TODO how to divide by AST?
+                raise NotImplementedError(
+                    "Division of a FixedPrecisionTensor by an AdditiveSharingTensor not implemented"
+                )
+
+        elif (
+            cmd == "mul"
+            and isinstance(self.child, (AdditiveSharingTensor, MultiPointerTensor))
+            and isinstance(other.child, (AdditiveSharingTensor, MultiPointerTensor))
+        ):
+            # If we try to multiply a FPT>torch.tensor with a FPT>AST,
+            # we swap operators so that we do the same operation as above
+            new_self, new_other, _ = hook_args.unwrap_args_from_method("mul", self, other, None)
+
+        else:
+            # Replace all syft tensor with their child attribute
+            new_self, new_other, _ = hook_args.unwrap_args_from_method(cmd, self, other, None)
+
+            # To avoid problems with negative numbers
+            # we take absolute value of the operands
+            # The problems could be 1) bad truncation for multiplication
+            # 2) overflow when scaling self in division
+
+            # sgn_self is 1 when new_self is positive else it's 0
+            # The comparison is different is new_self is a torch tensor or an AST
+            sgn_self = (
+                (new_self < self.field // 2).long()
+                if isinstance(new_self, torch.Tensor)
+                else new_self > 0
+            )
+            pos_self = new_self * sgn_self
+            neg_self = (
+                (self.field - new_self) * (1 - sgn_self)
+                if isinstance(new_self, torch.Tensor)
+                else new_self * (sgn_self - 1)
+            )
+            new_self = neg_self + pos_self
+
+            # sgn_other is 1 when new_other is positive else it's 0
+            # The comparison is different is new_other is a torch tensor or an AST
+            sgn_other = (
+                (new_other < self.field // 2).long()
+                if isinstance(new_other, torch.Tensor)
+                else new_other > 0
+            )
+            pos_other = new_other * sgn_other
+            neg_other = (
+                (self.field - new_other) * (1 - sgn_other)
+                if isinstance(new_other, torch.Tensor)
+                else new_other * (sgn_other - 1)
+            )
+            new_other = neg_other + pos_other
+
+            # If both have the same sign, sgn is 1 else it's 0
+            # To be able to write sgn = 1 - (sgn_self - sgn_other) ** 2,
+            # we would need to overload the __add__ for operators int and AST.
+            sgn = -((sgn_self - sgn_other) ** 2) + 1
+            changed_sign = True
+
+            if cmd == "div":
+                new_self *= self.base ** self.precision_fractional
 
         # Send it to the appropriate class and get the response
-        response = getattr(new_self, "mul")(*new_args, **new_kwargs)
+        response = getattr(new_self, cmd)(new_other)
 
         # Put back SyftTensor on the tensors found in the response
-        response = syft.frameworks.torch.hook_args.hook_response(
-            "mul", response, wrap_type=type(self), wrap_args=self.get_class_attributes()
+        response = hook_args.hook_response(
+            cmd, response, wrap_type=type(self), wrap_args=self.get_class_attributes()
         )
 
-        other = args[0]
+        if not isinstance(other, (int, torch.Tensor, AdditiveSharingTensor)):
+            if cmd == "mul":
+                # If operation is mul, we need to truncate
+                response = response.truncate(self.precision_fractional, check_sign=False)
 
-        assert (
-            self.precision_fractional == other.precision_fractional
-        ), "In mul, all args should have the same precision_fractional"
+            response %= self.field  # Wrap around the field
 
-        return response.truncate(other.precision_fractional)
+            if changed_sign:
+                # Give back its sign to response
+                pos_res = response * sgn
+                neg_res = response * (sgn - 1)
+                response = neg_res + pos_res
+
+        else:
+            response %= self.field  # Wrap around the field
+
+        return response
+
+    def mul(self, other):
+        return self.mul_and_div(other, "mul")
 
     __mul__ = mul
+
+    def __imul__(self, other):
+        self.child = self.mul_and_div(other, "mul").child
+        return self
+
+    mul_ = __imul__
+
+    def div(self, other):
+        return self.mul_and_div(other, "div")
+
+    __truediv__ = div
+
+    def __itruediv__(self, other):
+        self.child = self.mul_and_div(other, "div").child
+        return self
+
+    def pow(self, power):
+        """
+        Compute integer power of a number by recursion using mul
+
+        This uses the following trick:
+         - Divide power by 2 and multiply base to itself (if the power is even)
+         - Decrement power by 1 to make it even and then follow the first step
+
+        Args:
+            power (int): the exponent supposed to be an integer > 0
+        """
+        base = self
+
+        result = None
+        while power > 0:
+            # If power is odd
+            if power % 2 == 1:
+                result = result * base if result is not None else base
+
+            # Divide the power by 2
+            power = power // 2
+            # Multiply base to itself
+            base = base * base
+
+        return result
+
+    __pow__ = pow
 
     def matmul(self, *args, **kwargs):
         """
         Hook manually matmul to add the truncation part which is inherent to multiplication
         in the fixed precision setting
         """
-        # Replace all syft tensor with their child attribute
-        new_self, new_args, new_kwargs = syft.frameworks.torch.hook_args.hook_method_args(
-            "matmul", self, args, kwargs
-        )
+
+        other = args[0]
+
+        if isinstance(other, FixedPrecisionTensor):
+            assert (
+                self.precision_fractional == other.precision_fractional
+            ), "In matmul, all args should have the same precision_fractional"
+
+        if isinstance(self.child, AdditiveSharingTensor) and isinstance(other.child, torch.Tensor):
+            # If we try to matmul a FPT>AST with a FPT>torch.tensor,
+            # we want to perform AST @ torch.tensor
+            new_self = self.child
+            new_args = (other,)
+            new_kwargs = kwargs
+
+        elif isinstance(other.child, AdditiveSharingTensor) and isinstance(
+            self.child, torch.Tensor
+        ):
+            # If we try to matmul a FPT>torch.tensor with a FPT>AST,
+            # we swap operators so that we do the same operation as above
+            new_self = other.child
+            new_args = (self,)
+            new_kwargs = kwargs
+        else:
+            # Replace all syft tensor with their child attribute
+            new_self, new_args, new_kwargs = hook_args.unwrap_args_from_method(
+                "matmul", self, args, kwargs
+            )
 
         # Send it to the appropriate class and get the response
         response = getattr(new_self, "matmul")(*new_args, **new_kwargs)
 
         # Put back SyftTensor on the tensors found in the response
-        response = syft.frameworks.torch.hook_args.hook_response(
+        response = hook_args.hook_response(
             "matmul", response, wrap_type=type(self), wrap_args=self.get_class_attributes()
         )
 
-        other = args[0]
+        response %= self.field  # Wrap around the field
+        response = response.truncate(other.precision_fractional)
 
-        assert (
-            self.precision_fractional == other.precision_fractional
-        ), "In matmul, all args should have the same precision_fractional"
+        return response
 
-        return response.truncate(other.precision_fractional)
+    __matmul__ = matmul
+    mm = matmul
+
+    def reciprocal(self):
+        ones = self * 0 + 1
+        return ones / self
+
+    # Approximations:
+    def inverse(self, iterations=8):
+        """
+        Computes an approximation of the matrix inversion using Newton-Schulz
+        iterations
+        """
+        # TODO: should we add non-approximate version if self.child is a pure tensor?
+
+        assert len(self.shape) >= 2, "Can't compute inverse on non-matrix"
+        assert self.shape[-1] == self.shape[-2], "Must be batches of square matrices"
+
+        inverse = (0.1 * torch.eye(self.shape[-1])).fix_prec(**self.get_class_attributes()).child
+
+        for _ in range(iterations):
+            inverse = 2 * inverse - inverse @ self @ inverse
+
+        return inverse
+
+    def exp(self, iterations=8):
+        """
+        Approximates the exponential function using a limit approximation:
+        exp(x) = \lim_{n -> infty} (1 + x / n) ^ n
+
+        Here we compute exp by choosing n = 2 ** d for some large d equal to
+        iterations. We then compute (1 + x / n) once and square `d` times.
+
+        Args:
+            iterations (int): number of iterations for limit approximation
+
+        Ref: https://github.com/LaRiffle/approximate-models
+        """
+        return (1 + self / 2 ** iterations) ** (2 ** iterations)
+
+    def sign(self):
+        return (self > 0) + (self < 0) * (-1)
+
+    @staticmethod
+    def _sigmoid_exp(tensor):
+        """
+        Implementation taken from FacebookResearch - CrypTen project
+
+        Compute the sigmoid using the exp approximation
+        sigmoid(x) = 1 / (1 + exp(-x))
+
+        For stability:
+            sigmoid(x) = (sigmoid(|x|) - 0.5) * sign(x) + 0.5
+
+        Ref: https://timvieira.github.io/blog/post/2014/02/11/exp-normalize-trick/#numerically_stable_sigmoid_function
+
+        Args:
+            tensor (tensor): values where sigmoid should be approximated
+        """
+
+        sign = tensor.sign()
+
+        # Make sure the elements are all positive
+        x = tensor * sign
+        ones = tensor * 0 + 1
+        half = ones.div(2)
+        result = (ones + (-ones * x).exp()).reciprocal()
+        return (result - half) * sign + half
+
+    @staticmethod
+    def _sigmoid_maclaurin(tensor):
+        """
+        Approximates the sigmoid function using Maclaurin, with polynomial
+        interpolation of degree 5 over [-8,8]
+        NOTE: This method is faster but not as precise as "exp"
+        Ref: https://mortendahl.github.io/2017/04/17/private-deep-learning-with-mpc/#approximating-sigmoid
+
+        Args:
+            tensor (tensor): values where sigmoid should be approximated
+        """
+
+        weights = (
+            torch.tensor([0.5, 1.91204779e-01, -4.58667307e-03, 4.20690803e-05])
+            .fix_precision(**tensor.get_class_attributes())
+            .child
+        )
+        degrees = [0, 1, 3, 5]
+
+        # initiate with term of degree 0 to avoid errors with tensor ** 0
+        one = tensor * 0 + 1
+        result = one * weights[0]
+        for i, d in enumerate(degrees[1:]):
+            result += (tensor ** d) * weights[i + 1]
+
+        return result
+
+    @staticmethod
+    def _sigmoid_chebyshev(tensor, maxval: int = 6, terms: int = 32):
+        """
+        Implementation taken from FacebookResearch - CrypTen project
+        Computes the sigmoid function as
+                 sigmoid(x) = (tanh(x /2) + 1) / 2
+
+        Tanh is approximated using chebyshev polynomials
+        Args:
+             maxval (int): interval width used for tanh chebyshev polynomials
+             terms (int): highest degree of Chebyshev polynomials for tanh.
+                          Must be even and at least 6.
+        """
+        tanh_approx = tensor._tanh_chebyshev(tensor.div(2), maxval, terms)
+
+        return tanh_approx.div(2) + 0.5
+
+    def sigmoid(tensor, method="exp"):
+        """
+        Approximates the sigmoid function using a given method
+
+        Args:
+            tensor: the fixed precision tensor
+            method (str): (default = "chebyshev")
+                Possible values: "exp", "maclaurin", "chebyshev"
+        """
+
+        sigmoid_f = getattr(tensor, f"_sigmoid_{method}")
+
+        return sigmoid_f(tensor)
+
+    def log(self, iterations=2, exp_iterations=8):
+        """Approximates the natural logarithm using 8th order modified Householder iterations.
+        Recall that Householder method is an algorithm to solve a non linear equation f(x) = 0.
+        Here  f: x -> 1 - C * exp(-x)  with C = self
+
+        Iterations are computed by:
+            y_0 = some constant
+            h = 1 - self * exp(-y_n)
+            y_{n+1} = y_n - h * (1 + h / 2 + h^2 / 3 + h^3 / 6 + h^4 / 5 + h^5 / 7)
+
+        Args:
+            iterations (int): number of iterations for 6th order modified
+                Householder approximation.
+            exp_iterations (int): number of iterations for limit approximation of exp
+
+        Ref: https://github.com/LaRiffle/approximate-models
+        """
+
+        y = self / 31 + 1.59 - 20 * (-2 * self - 1.4).exp(iterations=exp_iterations)
+
+        # 6th order Householder iterations
+        for i in range(iterations):
+            h = [1 - self * (-y).refresh().exp(iterations=exp_iterations)]
+            for i in range(1, 5):
+                h.append(h[-1] * h[0])
+
+            y -= h[0] * (1 + h[0] / 2 + h[1] / 3 + h[2] / 4 + h[3] / 5 + h[4] / 6)
+
+        return y
+
+    @staticmethod
+    def _tanh_chebyshev(tensor, maxval: int = 6, terms: int = 32):
+        """
+        Implementation taken from FacebookResearch - CrypTen project
+        Computes tanh via Chebyshev approximation with truncation.
+          tanh(x) = \sum_{j=1}^terms c_{2j - 1} P_{2j - 1} (x / maxval)
+          where c_i is the ith Chebyshev series coefficient and P_i is ith polynomial.
+        The approximation is truncated to +/-1 outside [-maxval, maxval].
+        Args:
+            tensor (tensor): values where the tanh needs to be approximated
+            maxval (int): interval width used for computing chebyshev polynomials
+            terms (int): highest degree of Chebyshev polynomials.
+                         Must be even and at least 6.
+        More details can be found in the paper:
+           Guo, Chuan and Hannun, Awni and Knott, Brian and van der Maaten,
+           Laurens and Tygert, Mark and Zhu, Ruiyu,
+           "Secure multiparty computations in floating-point arithmetic", Jan-2020
+           Link: http://tygert.com/realcrypt.pdf
+
+        """
+
+        coeffs = syft.common.util.chebyshev_series(torch.tanh, maxval, terms)[1::2]
+        coeffs = coeffs.fix_precision(**tensor.get_class_attributes()) % tensor.field
+        coeffs = coeffs.unsqueeze(1)
+
+        value = torch.tensor(maxval).fix_precision(**tensor.get_class_attributes()) % tensor.field
+        tanh_polys = syft.common.util.chebyshev_polynomials(tensor.div(value.child), terms)
+        tanh_polys_flipped = tanh_polys.unsqueeze(dim=-1).transpose(0, -1).squeeze(dim=0)
+
+        out = tanh_polys_flipped.matmul(coeffs.child)
+
+        # truncate outside [-maxval, maxval]
+        gate_up = tensor > value
+        gate_down = -tensor > value
+        res = gate_up - gate_down
+        out = out.squeeze(1) * (1 - gate_up - gate_down)
+        out = res + out
+
+        return out
+
+    @staticmethod
+    def _tanh_sigmoid(tensor):
+        """
+        Compute the tanh using the sigmoid approximation
+
+        Args:
+            tensor (tensor): values where tanh should be approximated
+        """
+
+        return 2 * torch.sigmoid(2 * tensor) - 1
+
+    def tanh(tensor, method="chebyshev"):
+        tanh_f = getattr(tensor, f"_tanh_{method}")
+
+        return tanh_f(tensor)
+
+    # Binary ops
+    @overloaded.method
+    def __gt__(self, _self, other):
+        result = _self.__gt__(other)
+        return result.long() * self.base ** self.precision_fractional
+
+    @overloaded.method
+    def __ge__(self, _self, other):
+        result = _self.__ge__(other)
+        return result.long() * self.base ** self.precision_fractional
+
+    @overloaded.method
+    def __lt__(self, _self, other):
+        result = _self.__lt__(other)
+        return result.long() * self.base ** self.precision_fractional
+
+    @overloaded.method
+    def __le__(self, _self, other):
+        result = _self.__le__(other)
+        return result.long() * self.base ** self.precision_fractional
+
+    @overloaded.method
+    def eq(self, _self, other):
+        result = _self.eq(other)
+        return result.long() * self.base ** self.precision_fractional
+
+    __eq__ = eq
+
+    @staticmethod
+    @overloaded.module
+    def torch(module):
+        def add(self, other):
+            return self.__add__(other)
+
+        module.add = add
+
+        def sub(self, other):
+            return self.__sub__(other)
+
+        module.sub = sub
+
+        def mul(self, other):
+            return self.__mul__(other)
+
+        module.mul = mul
+
+        def div(self, other):
+            return self.__truediv__(other)
+
+        module.div = div
+
+        def matmul(self, other):
+            return self.matmul(other)
+
+        module.matmul = matmul
+        module.mm = matmul
+
+        def addmm(bias, input_tensor, weight):
+            matmul = input_tensor.matmul(weight)
+            result = bias.add(matmul)
+            return result
+
+        module.addmm = addmm
+
+        def inverse(self):
+            return self.inverse()
+
+        module.inverse = inverse
+
+        def exp(tensor):
+            return tensor.exp()
+
+        module.exp = exp
+
+        def sigmoid(tensor):
+            return tensor.sigmoid()
+
+        module.sigmoid = sigmoid
+
+        def log(tensor):
+            return tensor.log()
+
+        module.log = log
+
+        def tanh(tensor):
+            return tensor.tanh()
+
+        module.tanh = tanh
+
+        def dot(self, other):
+            return self.__mul__(other).sum()
+
+        module.dot = dot
+
+        # You can also overload functions in submodules!
+        # Modules should be registered just like functions
+        module.nn = nn  # Handles all the overloading properly
 
     @classmethod
     def handle_func_command(cls, command):
@@ -184,28 +769,23 @@ class FixedPrecisionTensor(AbstractTensor):
         response and replace a FixedPrecision on top of all tensors found in
         the response.
         :param command: instruction of a function command: (command name,
-        <no self>, arguments[, kwargs])
+        <no self>, arguments[, kwargs_])
         :return: the response of the function command
         """
-        # TODO: add kwargs in command
-        cmd, _, args, kwargs = command
+        cmd, _, args_, kwargs_ = command
 
-        # unhook
-        if cmd == "torch.nn.functional.linear":
-            return torch.nn.functional.native_linear(*args)
+        tensor = args_[0] if not isinstance(args_[0], (tuple, list)) else args_[0][0]
 
-        # overwrite
-        if cmd == "torch.addmm":
-            bias, input_tensor, weight = args
-            matmul = input_tensor.matmul(weight)
-            r = bias.add(matmul)
-            return r
+        # Check that the function has not been overwritten
+        try:
+            # Try to get recursively the attributes in cmd = "<attr1>.<attr2>.<attr3>..."
+            cmd = cls.rgetattr(cls, cmd)
+            return cmd(*args_, **kwargs_)
+        except AttributeError:
+            pass
 
-        # TODO: I can't manage the import issue, can you?
         # Replace all FixedPrecisionTensor with their child attribute
-        new_args, new_kwargs, new_type = syft.frameworks.torch.hook_args.hook_function_args(
-            cmd, args, kwargs
-        )
+        new_args, new_kwargs, new_type = hook_args.unwrap_args_from_function(cmd, args_, kwargs_)
 
         # build the new command
         new_command = (cmd, None, new_args, new_kwargs)
@@ -214,15 +794,107 @@ class FixedPrecisionTensor(AbstractTensor):
         response = new_type.handle_func_command(new_command)
 
         # Put back FixedPrecisionTensor on the tensors found in the response
-        response = syft.frameworks.torch.hook_args.hook_response(cmd, response, wrap_type=cls)
+        response = hook_args.hook_response(
+            cmd, response, wrap_type=cls, wrap_args=tensor.get_class_attributes()
+        )
 
         return response
 
-    def get(self):
-        """Just a pass through. This is most commonly used when calling .get() on a
-        FixedPrecisionTensor which has also been shared."""
-        return FixedPrecisionTensor().on(self.child.get())
+    def share(self, *owners, field=None, crypto_provider=None):
+        """
+        Forward the .share() command to the child tensor, and reconstruct a new
+        FixedPrecisionTensor since the command is not inplace and should return
+        a new chain
 
-    def share(self, *owners):
-        self.child = self.child.share(*owners)
+        Args:
+            *owners: the owners of the shares of the resulting AdditiveSharingTensor
+            field: the field size in which the share values live
+            crypto_provider: the worker used to provide the crypto primitives used
+                to perform some computations on AdditiveSharingTensors
+
+        Returns:
+            A FixedPrecisionTensor whose child has been shared
+        """
+        if field is None:
+            field = self.field
+        else:
+            assert (
+                field == self.field
+            ), "When sharing a FixedPrecisionTensor, the field of the resulting AdditiveSharingTensor \
+                must be the same as the one of the original tensor"
+        tensor = FixedPrecisionTensor(owner=self.owner, **self.get_class_attributes())
+
+        tensor.child = self.child.share(
+            *owners, field=field, crypto_provider=crypto_provider, no_wrap=True
+        )
+        return tensor
+
+    def share_(self, *args, **kwargs):
+        """
+        Performs an inplace call to share. The FixedPrecisionTensor returned is therefore the same,
+        contrary to the classic share version version
+        """
+        self.child = self.child.share_(*args, no_wrap=True, **kwargs)
         return self
+
+    @staticmethod
+    def simplify(worker: AbstractWorker, tensor: "FixedPrecisionTensor") -> tuple:
+        """Takes the attributes of a FixedPrecisionTensor and saves them in a tuple.
+
+        Args:
+            worker: the worker doing the serialization
+            tensor: a FixedPrecisionTensor.
+
+        Returns:
+            tuple: a tuple holding the unique attributes of the fixed precision tensor.
+        """
+        chain = None
+        if hasattr(tensor, "child"):
+            chain = syft.serde.msgpack.serde._simplify(worker, tensor.child)
+
+        return (
+            syft.serde.msgpack.serde._simplify(worker, tensor.id),
+            tensor.field,
+            tensor.base,
+            tensor.precision_fractional,
+            tensor.kappa,
+            syft.serde.msgpack.serde._simplify(worker, tensor.tags),
+            syft.serde.msgpack.serde._simplify(worker, tensor.description),
+            chain,
+        )
+
+    @staticmethod
+    def detail(worker: AbstractWorker, tensor_tuple: tuple) -> "FixedPrecisionTensor":
+        """
+            This function reconstructs a FixedPrecisionTensor given it's attributes in form of a tuple.
+            Args:
+                worker: the worker doing the deserialization
+                tensor_tuple: a tuple holding the attributes of the FixedPrecisionTensor
+            Returns:
+                FixedPrecisionTensor: a FixedPrecisionTensor
+            Examples:
+                shared_tensor = detail(data)
+            """
+
+        tensor_id, field, base, precision_fractional, kappa, tags, description, chain = tensor_tuple
+
+        tensor = FixedPrecisionTensor(
+            owner=worker,
+            id=syft.serde.msgpack.serde._detail(worker, tensor_id),
+            field=field,
+            base=base,
+            precision_fractional=precision_fractional,
+            kappa=kappa,
+            tags=syft.serde.msgpack.serde._detail(worker, tags),
+            description=syft.serde.msgpack.serde._detail(worker, description),
+        )
+
+        if chain is not None:
+            chain = syft.serde.msgpack.serde._detail(worker, chain)
+            tensor.child = chain
+
+        return tensor
+
+
+### Register the tensor with hook_args.py ###
+hook_args.default_register_tensor(FixedPrecisionTensor)

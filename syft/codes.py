@@ -1,16 +1,38 @@
-class MSGTYPE(object):
-    CMD = 1
-    OBJ = 2
-    OBJ_REQ = 3
-    OBJ_DEL = 4
-    EXCEPTION = 5
-    IS_NONE = 6
+class PLAN_CMDS(object):
+    FETCH_PLAN = "fetch_plan"
+    FETCH_PROTOCOL = "fetch_protocol"
 
 
-code2MSGTYPE = {}
-code2MSGTYPE[1] = "CMD"
-code2MSGTYPE[2] = "OBJ"
-code2MSGTYPE[3] = "OBJ_REQ"
-code2MSGTYPE[4] = "OBJ_DEL"
-code2MSGTYPE[5] = "EXCEPTION"
-code2MSGTYPE[6] = "IS_NONE"
+class TENSOR_SERIALIZATION(object):
+    TORCH = "torch"
+    NUMPY = "numpy"
+    TF = "tf"
+    ALL = "all"
+
+
+class GATEWAY_ENDPOINTS(object):
+    SEARCH_TAGS = "/search"
+    SEARCH_MODEL = "/search-model"
+    SEARCH_ENCRYPTED_MODEL = "/search-encrypted-model"
+    SELECT_MODEL_HOST = "/choose-model-host"
+    SELECT_ENCRYPTED_MODEL_HOSTS = "/choose-encrypted-model-host"
+
+
+class REQUEST_MSG(object):
+    TYPE_FIELD = "type"
+    GET_ID = "get-id"
+    CONNECT_NODE = "connect-node"
+    HOST_MODEL = "host-model"
+    RUN_INFERENCE = "run-inference"
+    LIST_MODELS = "list-models"
+    DELETE_MODEL = "delete-model"
+    RUN_INFERENCE = "run-inference"
+    AUTHENTICATE = "authentication"
+
+
+class RESPONSE_MSG(object):
+    NODE_ID = "id"
+    ERROR = "error"
+    SUCCESS = "success"
+    MODELS = "models"
+    INFERENCE_RESULT = "prediction"
